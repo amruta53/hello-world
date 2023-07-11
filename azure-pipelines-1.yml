@@ -1,0 +1,234 @@
+resources:
+  repositories:
+  - repository: self
+trigger:
+ batch: true
+ branches:
+    include:
+    - dev
+
+variables:
+- name: BuildConfiguration
+  value: release
+- name: solution
+  value: '**\*.sln'
+- name: Major
+  value: '1'
+- name: Minor
+  value: '0'
+- name: Patch
+  value: '1'
+- name: imageRepository
+  value: 'services.candidates'
+- name: containerRegistry
+  value: 'co-wus2-acr-d01-sc'
+- name: dockerfilePath
+  value: '$(Build.SourcesDirectory)/Dockerfile.CI'
+- name: projectName
+  value: 'candidates'
+- name: buildArguments
+  value: "--build-arg FEED_URL=$(artifactsEndpoint) --build-arg PAT=$(artifactsAccessToken)"
+- name: HELM_EXPERIMENTAL_OCI
+  value: 1 
+- name: helmChartVersion
+  value: "1.0"
+- name: imageTag
+  value: $(Build.BuildNumber)
+- name: pipelineName
+  value: 'Services_Candidates_CICD'
+- name: registryServerName
+  value: "$(registryName).azurecr.io"  
+- name: namespace
+  value: 'dev'
+- name: releaseName
+  value: 'candidates'  
+- name: envName
+  value: 'candidates-dev'
+- name: chartName
+  value: 'cowus2oneacrd01.azurecr.io/charts.candidates:$(imageTag)'
+- group: 'co-wus2-one-artifacts-d01'
+- group: 'co-wus2-one-acr-d01-login'
+
+#Use below line if you want to mention patch# along with same version#
+#name: $(Major).$(Minor).$(Patch)
+
+name: $(Major).$(Minor).$(rev:r)
+
+stages:
+- stage: CodeBuild  
+  pool:
+   vmImage: 'windows-2019'
+  jobs:
+  - job: 
+    steps:     
+
+      - task: NuGetCommand@2
+        inputs:
+          command: 'restore'
+          restoreSolution: $(solution)
+          selectOrConfig: config
+          nugetConfigPath: nuget.config
+          includeNuGetOrg: false
+             
+      - task: DotNetCoreCLI@2
+        displayName: Build
+        inputs:
+         command: build
+         projects: $(solution)
+         arguments: '--configuration $(BuildConfiguration)' 
+
+      - task: ResharperCli@2
+        inputs:
+          solutionOrProjectPath: 'One.Services.candidates.sln'
+          failBuildLevelSelector: 'Error'
+          failBuildOnCodeIssues: true
+          additionalArguments: /disable-settings-layers:SolutionPersonal --properties:Configuration=$(BuildConfiguration)
+          resultsOutputFilePath: $(Build.ArtifactStagingDirectory)/tests-results/ReportGenerator/ResharperResults.xml
+
+      - task: DotNetCoreCLI@2
+        displayName: Publish Code
+        inputs:
+          command: publish
+          publishWebProjects: false
+          projects: $(solution)
+          arguments: --configuration $(BuildConfiguration) --output $(Build.ArtifactStagingDirectory)\src
+          zipAfterPublish: false
+
+      - task: DeleteFiles@1
+        inputs:
+          SourceFolder: $(Build.ArtifactStagingDirectory)
+          Contents: >
+              **/JetBrains.ReSharper.CommandLineTools.2020.2.4
+                NuGet.exe
+                Summary.md
+
+      - task: DotNetCoreCLI@2
+        displayName: Collect Code Coverage
+        inputs:
+          command: 'test'
+          projects: |
+                **/*.csproj
+                !**/One.Services.Candidates.API.IntegrationTests.csproj
+          arguments: '--configuration $(buildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura /p:CoverletOutput=$(Build.SourcesDirectory)/TestResults/Coverage/'
+          publishTestResults: true
+
+      - task: reportgenerator@4
+        inputs:
+            reports: '**/coverage.cobertura.xml'
+            targetdir: 'coveragereport'
+            reporttypes: 'HtmlInline_AzurePipelines;Cobertura'
+        enabled: true
+
+      - task: PublishCodeCoverageResults@1
+        displayName: 'Publish code coverage report'
+        inputs:
+         codeCoverageTool: 'Cobertura'
+         summaryFileLocation: '$(Build.SourcesDirectory)/**/coverage.cobertura.xml'
+         reportDirectory: 'CoverageReport'
+         
+      - task: PublishBuildArtifacts@1
+        displayName: Publish Build Artifacts
+        inputs:
+         pathtoPublish: $(Build.ArtifactStagingDirectory)
+         artifactName: Artifacts
+- stage: ImageBuild
+  dependsOn: CodeBuild
+  pool:
+   vmImage: 'ubuntu-latest'
+  jobs:
+  - job: 
+    steps:
+    
+     - task: Docker@2
+       displayName: Build Docker Image
+       enabled: true
+       inputs:
+          containerRegistry: $(containerRegistry)
+          repository: $(imageRepository)
+          command: 'build'
+          Dockerfile: $(dockerfilePath)                
+          arguments: $(buildArguments)
+          tags: $(imageTag)
+          
+     - task: Docker@2
+       displayName: push an image to container registry
+       inputs:
+          containerRegistry: $(containerRegistry)          
+          command: 'push'
+          repository: $(imageRepository)              
+          tags: $(imageTag)
+    
+     - task: HelmInstaller@1
+       displayName: 'Install helm'
+       inputs:
+        helmVersionToInstall: 'latest'
+      
+     - task: PowerShell@2
+       enabled: true
+       inputs:
+        targetType: 'inline'
+        script: |
+         $data= Get-Content -path $(build.sourcesdirectory)/k8s/charts/candidates/Chart.yaml
+         $replaceVersion = $data -replace ("version: 0.1.0","version: $(Build.BuildNumber)")
+         $replaceVersion = $replaceVersion -replace ("appVersion: 1.0","appVersion: $(Build.BuildNumber)")
+         echo $replaceVersion
+         $replaceVersion | out-file -filepath $(build.sourcesdirectory)/k8s/charts/candidates/Chart.yaml
+         
+     - task: Bash@3
+       displayName: Helm Package
+       inputs:
+         targetType: 'inline'
+         script: |
+                echo $(registryPassword) | helm registry login $(registryName).azurecr.io --username $(registryLogin) --password-stdin      
+                helm chart save $(build.sourcesdirectory)/k8s/charts/$(projectName) $(registryName).azurecr.io/charts.$(projectName):$(imageTag) 
+                helm chart push $(registryName).azurecr.io/charts.$(projectName):$(imageTag)           
+         failOnStderr: true    
+- stage:   DevRelease
+  dependsOn: ImageBuild
+  pool:
+   vmImage:  'ubuntu-latest'
+  jobs:
+    - deployment: DeployToDevAKS
+      displayName: Deploy To Dev AKS
+      environment: 
+        name: $(envName)
+        resourceName: 'dev'
+        resourceType: Kubernetes
+      strategy:
+        runOnce:
+          deploy:
+            steps:    
+             - task: HelmInstaller@1
+               displayName: 'Install helm'
+               inputs:
+                helmVersionToInstall: 'latest'
+                
+             - task: DownloadPipelineArtifact@2
+               inputs:      
+                pipeline: $(pipelineName)   
+                
+             - task: Bash@3
+               displayName: "Pull Helm Chart from ACR" 
+               inputs:
+                targetType: 'inline'
+                script: |
+                      echo $(registryPassword) | helm registry login $(registryServerName) --username $(registryLogin) --password-stdin
+                      helm chart pull $(registryServerName)/charts.$(projectName):$(imageTag)      
+                      helm chart export $(registryServerName)/charts.$(projectName):$(imageTag) --destination $(pipeline.workspace)/install                
+                failOnStderr: true   
+      
+             - task: HelmDeploy@0
+               inputs:
+                connectionType: 'Kubernetes Service Connection'
+                kubernetesServiceConnection: 'co-wus2-one-aks-d01-sc'
+                namespace: $(namespace)
+                command: upgrade
+                chartName: $(chartName)
+                chartType: FilePath
+                chartPath: $(pipeline.workspace)/install/$(projectName)   
+                install: true
+                releaseName: $(releaseName)                                                       
+                chartVersion: $helmChartVersion
+                waitForExecution : false
+                overrideValues: image.repository=$(registryServerName)/services.$(projectName),image.tag=$(imageTag)
+                arguments: "--create-namespace" 
